@@ -37,6 +37,21 @@ struct CollectParams:
     amount0Max: uint128
     amount1Max: uint128
 
+struct ExactInputSingleParams:
+    tokenIn: address
+    tokenOut: address
+    fee: uint24
+    recipient: address
+    deadline: uint256
+    amountIn: uint256
+    amountOutMinimum: uint256
+    sqrtPriceLimitX96: uint160
+
+enum WithdrawType:
+    CANCEL
+    PROFIT_TAKING
+    EXPIRE
+
 interface WrappedEth:
     def deposit(): payable
     def withdraw(amount: uint256): nonpayable
@@ -53,6 +68,12 @@ interface Factory:
     def getPool(tokenA: address, tokenB: address, fee: uint24) -> address: view
     def feeAmountTickSpacing(fee: uint24) -> int24: view
 
+interface SwapRouter:
+    def exactInputSingle(params: ExactInputSingleParams) -> uint256: payable
+
+interface Pool:
+    def fee() -> uint24: view
+
 interface ERC20:
     def balanceOf(_owner: address) -> uint256: view
     def transfer(_to: address, _value: uint256) -> bool: nonpayable
@@ -61,6 +82,7 @@ interface ERC20:
 
 NONFUNGIBLE_POSITION_MANAGER: immutable(address)
 FACTORY: immutable(address)
+ROUTER: immutable(address)
 WETH: immutable(address)
 VETH: constant(address) = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE
 MAX_SIZE: constant(uint256) = 8
@@ -69,17 +91,21 @@ DENOMINATOR: constant(uint256) = 10 ** 18
 event Deposited:
     token_id: indexed(uint256)
     depositor: indexed(address)
-    amount: uint256
-    pool: indexed(address)
-    from_tick: int24
-    to_tick: int24
+    token0: address
+    token1: address
+    amount0: uint256
+    profit_taking: uint256
+    stop_loss: uint256
+    expire: uint256
 
 event Withdrawn:
     token_id: indexed(uint256)
     withdrawer: indexed(address)
+    token0: address
+    token1: address
     recipient: indexed(address)
-    amount0: uint256
-    amount1: uint256
+    withdraw_amount: uint256
+    withdraw_type: WithdrawType
 
 event UpdateCompass:
     old_compass: address
@@ -113,7 +139,7 @@ service_fee_collector: public(address)
 service_fee: public(uint256)
 
 @external
-def __init__(_compass: address, nonfungible_position_manager: address, _refund_wallet: address, _fee: uint256, _service_fee_collector: address, _service_fee: uint256):
+def __init__(_compass: address, nonfungible_position_manager: address, router: address, _refund_wallet: address, _fee: uint256, _service_fee_collector: address, _service_fee: uint256):
     self.compass = _compass
     self.refund_wallet = _refund_wallet
     self.fee = _fee
@@ -127,6 +153,7 @@ def __init__(_compass: address, nonfungible_position_manager: address, _refund_w
     NONFUNGIBLE_POSITION_MANAGER = nonfungible_position_manager
     WETH = NonfungiblePositionManager(nonfungible_position_manager).WETH9()
     FACTORY = NonfungiblePositionManager(nonfungible_position_manager).factory()
+    ROUTER = router
 
 @internal
 def _safe_approve(_token: address, _to: address, _value: uint256):
@@ -143,7 +170,7 @@ def _safe_transfer_from(_token: address, _from: address, _to: address, _value: u
 @external
 @payable
 @nonreentrant('lock')
-def deposit(token0: address, amount: uint256, token1: address, fee: uint24, to_tick: int24):
+def deposit(token0: address, amount: uint256, token1: address, fee: uint24, to_tick: int24, profit_taking: uint256, stop_loss: uint256, expire: uint256):
     _value: uint256 = msg.value
     _fee: uint256 = self.fee
     if _fee > 0:
@@ -237,10 +264,10 @@ def deposit(token0: address, amount: uint256, token1: address, fee: uint24, to_t
         depositor: msg.sender,
         token_id: tokenId
     })
-    log Deposited(tokenId, msg.sender, _amount, pool, from_tick, to_tick)
+    log Deposited(tokenId, msg.sender, token0, token1, _amount, profit_taking, stop_loss, expire)
 
 @internal
-def _withdraw(tokenId: uint256, recipient: address):
+def _withdraw(tokenId: uint256, withdraw_type: WithdrawType) -> uint256:
     response_256: Bytes[256] = raw_call(
         NONFUNGIBLE_POSITION_MANAGER,
         _abi_encode(tokenId, method_id=method_id("positions(uint256)")),
@@ -276,23 +303,63 @@ def _withdraw(tokenId: uint256, recipient: address):
         depositor: empty(address),
         token_id: 0
     })
+    is_right: bool = False
+    if deposit.token0 == token0 or (deposit.token0 == VETH and token0 == WETH):
+        if withdraw_type != WithdrawType.CANCEL:
+            is_right = True
+    else:
+        if withdraw_type == WithdrawType.CANCEL:
+            is_right = True
+    fee: uint24 = Pool(deposit.pool).fee()
+    amount: uint256 = 0
+    if is_right:
+        if amount0 > 0:
+            self._safe_approve(token0, ROUTER, amount0)
+            amount1 += SwapRouter(ROUTER).exactInputSingle(ExactInputSingleParams({
+                tokenIn: token0,
+                tokenOut: token1,
+                fee: fee,
+                recipient: self,
+                deadline: block.timestamp,
+                amountIn: amount0,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            }))
+            amount0 = 0
+            amount = amount1
+    else:
+        if amount1 > 0:
+            self._safe_approve(token1, ROUTER, amount1)
+            amount0 += SwapRouter(ROUTER).exactInputSingle(ExactInputSingleParams({
+                tokenIn: token1,
+                tokenOut: token0,
+                fee: fee,
+                recipient: self,
+                deadline: block.timestamp,
+                amountIn: amount1,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            }))
+            amount1 = 0
+            amount = amount0
     if amount0 > 0:
         if token0 == WETH and (deposit.token0 == VETH or deposit.token1 == VETH):
             WrappedEth(WETH).withdraw(amount0)
             send(deposit.depositor, amount0)
         else:
-            self._safe_transfer(token0, recipient, amount0)
+            self._safe_transfer(token0, deposit.depositor, amount0)
     if amount1 > 0:
         if token1 == WETH and (deposit.token0 == VETH or deposit.token1 == VETH):
             WrappedEth(WETH).withdraw(amount1)
             send(deposit.depositor, amount1)
         else:
-            self._safe_transfer(token1, recipient, amount1)
-    log Withdrawn(tokenId, msg.sender, recipient, amount0, amount1)
+            self._safe_transfer(token1, deposit.depositor, amount1)
+    log Withdrawn(tokenId, msg.sender, deposit.token0, deposit.token1, deposit.depositor, amount, withdraw_type)
+    return amount
 
 @external
-@nonreentrant("lock")
-def withdraw(tokenId: uint256):
+def withdraw(tokenId: uint256, withdraw_type: WithdrawType) -> uint256:
+    assert msg.sender == empty(address) # this will work as a view function only
     deposit: Deposit = self.deposits[tokenId]
     response_64: Bytes[64] = raw_call(
         deposit.pool,
@@ -305,13 +372,18 @@ def withdraw(tokenId: uint256):
         assert tick >= deposit.to_tick
     else:
         assert tick <= deposit.to_tick
-    self._withdraw(tokenId, deposit.depositor)
+    return self._withdraw(tokenId, withdraw_type)
 
 @external
 @nonreentrant("lock")
-def multiple_withdraw(tokenIds: DynArray[uint256, MAX_SIZE]):
-    for tokenId in tokenIds:
-        deposit: Deposit = self.deposits[tokenId]
+def multiple_withdraw(tokenIds: DynArray[uint256, MAX_SIZE], expected: DynArray[uint256, MAX_SIZE], withdraw_types: DynArray[WithdrawType, MAX_SIZE]):
+    self._paloma_check()
+    _len: uint256 = len(tokenIds)
+    assert _len == len(expected) and _len == len(withdraw_types), "Validation error"
+    for i in range(MAX_SIZE):
+        if i >= len(tokenIds):
+            break
+        deposit: Deposit = self.deposits[tokenIds[i]]
         response_64: Bytes[64] = raw_call(
             deposit.pool,
             method_id("slot0()"),
@@ -323,22 +395,24 @@ def multiple_withdraw(tokenIds: DynArray[uint256, MAX_SIZE]):
             assert tick >= deposit.to_tick
         else:
             assert tick <= deposit.to_tick
-        self._withdraw(tokenId, deposit.depositor)
+        assert self._withdraw(tokenIds[i], withdraw_types[i]) >= expected[i], "High slippage"
 
 @external
 @nonreentrant("lock")
-def cancel(tokenId: uint256):
+def cancel(tokenId: uint256, expected: uint256):
     deposit: Deposit = self.deposits[tokenId]
     assert deposit.depositor == msg.sender
-    self._withdraw(tokenId, deposit.depositor)
+    assert self._withdraw(tokenId, WithdrawType.CANCEL) >= expected, "High slippage"
 
 @external
 @nonreentrant("lock")
-def multiple_cancel(tokenIds: DynArray[uint256, MAX_SIZE]):
-    for tokenId in tokenIds:
-        deposit: Deposit = self.deposits[tokenId]
+def multiple_cancel(tokenIds: DynArray[uint256, MAX_SIZE], expected: DynArray[uint256, MAX_SIZE]):
+    for i in range(MAX_SIZE):
+        if i >= len(tokenIds):
+            break
+        deposit: Deposit = self.deposits[tokenIds[i]]
         assert deposit.depositor == msg.sender
-        self._withdraw(tokenId, deposit.depositor)
+        assert self._withdraw(tokenIds[i], WithdrawType.CANCEL) >= expected[i], "High slippage"
 
 @internal
 def _paloma_check():
