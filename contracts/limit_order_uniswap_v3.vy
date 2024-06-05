@@ -1,111 +1,64 @@
 # pragma version 0.3.10
 # pragma optimize gas
 # pragma evm-version shanghai
+"""
+@title Uniswap v3 Limit Order Bot
+@license Apache 2.0
+@author Volume.finance
+"""
 
-struct Deposit:
-    pool: address
-    token0: address
-    token1: address
-    from_tick: int24
-    to_tick: int24
-    depositor: address
-    token_id: uint256
+struct SwapInfo:
+    path: Bytes[224]
+    amount: uint256
 
-struct MintParams:
-    token0: address
-    token1: address
-    fee: uint24
-    tickLower: int24
-    tickUpper: int24
-    amount0Desired: uint256
-    amount1Desired: uint256
-    amount0Min: uint256
-    amount1Min: uint256
-    recipient: address
-    deadline: uint256
-
-struct DecreaseLiquidityParams:
-    tokenId: uint256
-    liquidity: uint128
-    amount0Min: uint256
-    amount1Min: uint256
-    deadline: uint256
-
-struct CollectParams:
-    tokenId: uint256
-    recipient: address
-    amount0Max: uint128
-    amount1Max: uint128
-
-struct ExactInputSingleParams:
-    tokenIn: address
-    tokenOut: address
-    fee: uint24
+struct ExactInputParams:
+    path: Bytes[224]
     recipient: address
     deadline: uint256
     amountIn: uint256
     amountOutMinimum: uint256
-    sqrtPriceLimitX96: uint160
+
+struct Deposit:
+    depositor: address
+    path: Bytes[224]
+    amount: uint256
 
 enum WithdrawType:
     CANCEL
     PROFIT_TAKING
+    STOP_LOSS
     EXPIRE
+
+interface ERC20:
+    def balanceOf(_owner: address) -> uint256: view
+    def approve(_spender: address, _value: uint256) -> bool: nonpayable
+    def transfer(_to: address, _value: uint256) -> bool: nonpayable
+    def transferFrom(_from: address, _to: address, _value: uint256) -> bool: nonpayable
 
 interface WrappedEth:
     def deposit(): payable
     def withdraw(amount: uint256): nonpayable
 
-interface NonfungiblePositionManager:
-    def factory() -> address: view
-    def WETH9() -> address: view
-    def mint(params: MintParams) -> (uint256, uint128, uint256, uint256): payable
-    def decreaseLiquidity(params: DecreaseLiquidityParams) -> (uint256, uint256): payable
-    def collect(params: CollectParams) -> (uint256, uint256): payable
-    def burn(tokenId: uint256): payable
-
-interface Factory:
-    def getPool(tokenA: address, tokenB: address, fee: uint24) -> address: view
-    def feeAmountTickSpacing(fee: uint24) -> int24: view
-
 interface SwapRouter:
-    def exactInputSingle(params: ExactInputSingleParams) -> uint256: payable
-
-interface Pool:
-    def fee() -> uint24: view
-
-interface ERC20:
-    def balanceOf(_owner: address) -> uint256: view
-    def transfer(_to: address, _value: uint256) -> bool: nonpayable
-    def transferFrom(_from: address, _to: address, _value: uint256) -> bool: nonpayable
-    def approve(_spender: address, _value: uint256) -> bool: nonpayable
-
-NONFUNGIBLE_POSITION_MANAGER: immutable(address)
-FACTORY: immutable(address)
-ROUTER: immutable(address)
-WETH: immutable(address)
-VETH: constant(address) = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE
-MAX_SIZE: constant(uint256) = 8
-DENOMINATOR: constant(uint256) = 10 ** 18
+    def WETH9() -> address: pure
+    def exactInput(params: ExactInputParams) -> uint256: payable
 
 event Deposited:
-    token_id: indexed(uint256)
-    depositor: indexed(address)
+    deposit_id: uint256
     token0: address
     token1: address
     amount0: uint256
+    depositor: address
     profit_taking: uint256
     stop_loss: uint256
     expire: uint256
+    is_stable_swap: bool
 
 event Withdrawn:
-    token_id: indexed(uint256)
-    withdrawer: indexed(address)
-    token0: address
-    token1: address
-    recipient: indexed(address)
-    withdraw_amount: uint256
+    deposit_id: uint256
+    withdrawer: address
     withdraw_type: WithdrawType
+    withdraw_amount: uint256
 
 event UpdateCompass:
     old_compass: address
@@ -130,8 +83,14 @@ event UpdateServiceFee:
     old_service_fee: uint256
     new_service_fee: uint256
 
-deposits: public(HashMap[uint256, Deposit])
+WETH: immutable(address)
+VETH: constant(address) = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE # Virtual ETH
+MAX_SIZE: constant(uint256) = 8
+DENOMINATOR: constant(uint256) = 10 ** 18
+ROUTER: immutable(address)
 compass: public(address)
+deposit_size: public(uint256)
+deposits: public(HashMap[uint256, Deposit])
 refund_wallet: public(address)
 fee: public(uint256)
 paloma: public(bytes32)
@@ -139,8 +98,10 @@ service_fee_collector: public(address)
 service_fee: public(uint256)
 
 @external
-def __init__(_compass: address, nonfungible_position_manager: address, router: address, _refund_wallet: address, _fee: uint256, _service_fee_collector: address, _service_fee: uint256):
+def __init__(_compass: address, router: address, _refund_wallet: address, _fee: uint256, _service_fee_collector: address, _service_fee: uint256):
     self.compass = _compass
+    ROUTER = router
+    WETH = SwapRouter(ROUTER).WETH9()
     self.refund_wallet = _refund_wallet
     self.fee = _fee
     self.service_fee_collector = _service_fee_collector
@@ -150,274 +111,168 @@ def __init__(_compass: address, nonfungible_position_manager: address, router: a
     log UpdateFee(0, _fee)
     log UpdateServiceFeeCollector(empty(address), _service_fee_collector)
     log UpdateServiceFee(0, _service_fee)
-    NONFUNGIBLE_POSITION_MANAGER = nonfungible_position_manager
-    WETH = NonfungiblePositionManager(nonfungible_position_manager).WETH9()
-    FACTORY = NonfungiblePositionManager(nonfungible_position_manager).factory()
-    ROUTER = router
-
-@internal
-def _safe_approve(_token: address, _to: address, _value: uint256):
-    assert ERC20(_token).approve(_to, _value, default_return_value=True), "failed approve"
 
 @internal
 def _safe_transfer(_token: address, _to: address, _value: uint256):
-    assert ERC20(_token).transfer(_to, _value, default_return_value=True), "failed transfer"
-
-@internal
-def _safe_transfer_from(_token: address, _from: address, _to: address, _value: uint256):
-    assert ERC20(_token).transferFrom(_from, _to, _value, default_return_value=True), "failed transferFrom"
+    assert ERC20(_token).transfer(_to, _value, default_return_value=True), "Failed transfer"
 
 @external
 @payable
-@nonreentrant('lock')
-def deposit(token0: address, amount: uint256, token1: address, fee: uint24, to_tick: int24, profit_taking: uint256, stop_loss: uint256, expire: uint256):
+@nonreentrant("lock")
+def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_loss: uint256, expire: uint256):
+    assert block.timestamp < expire, "Invalidated expire"
     _value: uint256 = msg.value
     _fee: uint256 = self.fee
     if _fee > 0:
         assert _value >= _fee, "Insufficient fee"
         send(self.refund_wallet, _fee)
         _value = unsafe_sub(_value, _fee)
-    tokenA: address = token0
-    tokenB: address = token1
-    _service_fee: uint256 = self.service_fee
-    _amount: uint256 = amount
+    assert len(path) >= 43, "Path error"
+    token0: address = convert(slice(path, 0, 20), address)
+    fee_index: uint256 = 20
+    amount: uint256 = 0
     if token0 == VETH:
-        if _value != _amount:
-            assert _value > _amount
-            send(msg.sender, _value - _amount)
+        amount = amount0
+        assert _value >= amount, "Insuf deposit"
+        _value = unsafe_sub(_value, amount)
+        fee_index = 40
+    else:
+        amount = ERC20(token0).balanceOf(self)
+        assert ERC20(token0).transferFrom(msg.sender, self, amount, default_return_value=True), "Failed transferFrom"
+        amount = ERC20(token0).balanceOf(self) - amount
+    is_stable_swap: bool = True
+    for i in range(8):
+        if unsafe_add(fee_index, 3) >= len(path):
+            break
+        fee_level: uint256 = convert(slice(path, fee_index, 3), uint256)
+        if fee_level == 0:
+            break
+        if fee_level > 500:
+            is_stable_swap = False
+        fee_index = unsafe_add(fee_index, 23)
+    _amount0: uint256 = amount0
+    _service_fee: uint256 = self.service_fee
+    if token0 == VETH:
+        assert _value >= amount0, "Insufficient deposit"
+        if _value > _amount0:
+            send(msg.sender, unsafe_sub(_value, _amount0))
         if _service_fee > 0:
-            _service_fee_amount: uint256 = unsafe_div(_amount * _service_fee, DENOMINATOR)
+            _service_fee_amount: uint256 = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
             send(self.service_fee_collector, _service_fee_amount)
-            _amount = unsafe_sub(_amount, _service_fee_amount)
-        WrappedEth(WETH).deposit(value=_amount)
-        tokenA = WETH
+            _amount0 = unsafe_sub(_amount0, _service_fee_amount)
+        WrappedEth(WETH).deposit(value=_amount0)
     else:
         send(msg.sender, _value)
-        orig_balance: uint256 = ERC20(token0).balanceOf(self)
-        self._safe_transfer_from(token0, msg.sender, self, _amount)
-        assert ERC20(token0).balanceOf(self) == orig_balance + _amount
+        _amount0 = ERC20(token0).balanceOf(self)
+        assert ERC20(token0).transferFrom(msg.sender, self, amount0, default_return_value=True), "Failed transferFrom"
+        _amount0 = ERC20(token0).balanceOf(self) - _amount0
         if _service_fee > 0:
-            _service_fee_amount: uint256 = unsafe_div(_amount * _service_fee, DENOMINATOR)
+            _service_fee_amount: uint256 = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
             self._safe_transfer(token0, self.service_fee_collector, _service_fee_amount)
-            _amount = unsafe_sub(_amount, _service_fee_amount)
-    if token1 == VETH:
-        tokenB = WETH
-    pool: address = Factory(FACTORY).getPool(tokenA, tokenB, fee)
-    assert pool != empty(address)
-    tick_spacing: int24 = Factory(FACTORY).feeAmountTickSpacing(fee)
-    assert to_tick % tick_spacing == 0
-    response_64: Bytes[64] = raw_call(
-        pool,
-        method_id("slot0()"),
-        max_outsize = 64,
-        is_static_call = True
-    )
-
-    from_tick: int24 = convert(slice(response_64, 32, 32), int24)
-    tokenId: uint256 = 0
-    liquidity: uint128 = 0
-    amount0: uint256 = 0
-    amount1: uint256 = 0
-    if convert(tokenA, uint256) < convert(tokenB, uint256):
-        from_tick = from_tick / tick_spacing * tick_spacing + tick_spacing
-        assert to_tick > from_tick, "Wrong Tick"
-    else:
-        from_tick = from_tick - 1 / tick_spacing * tick_spacing
-        assert to_tick < from_tick, "Wrong Tick"
-    
-    self._safe_approve(tokenA, NONFUNGIBLE_POSITION_MANAGER, _amount)
-
-    if convert(tokenA, uint256) < convert(tokenB, uint256):
-        tokenId, liquidity, amount0, amount1 = NonfungiblePositionManager(NONFUNGIBLE_POSITION_MANAGER).mint(MintParams({
-            token0: tokenA,
-            token1: tokenB,
-            fee: fee,
-            tickLower: from_tick,
-            tickUpper: to_tick,
-            amount0Desired: _amount,
-            amount1Desired: 0,
-            amount0Min: 1,
-            amount1Min: 0,
-            recipient: self,
-            deadline: block.timestamp
-        }))
-    else:
-        tokenId, liquidity, amount0, amount1 = NonfungiblePositionManager(NONFUNGIBLE_POSITION_MANAGER).mint(MintParams({
-            token0: tokenB,
-            token1: tokenA,
-            fee: fee,
-            tickLower: to_tick,
-            tickUpper: from_tick,
-            amount0Desired: 0,
-            amount1Desired: _amount,
-            amount0Min: 0,
-            amount1Min: 1,
-            recipient: self,
-            deadline: block.timestamp
-        }))
-    self.deposits[tokenId] = Deposit({
-        pool: pool,
-        token0: token0,
-        token1: token1,
-        from_tick: from_tick,
-        to_tick: to_tick,
+            _amount0 = unsafe_sub(_amount0, _service_fee_amount)
+    assert _amount0 > 0, "Insufficient deposit"
+    deposit_id: uint256 = self.deposit_size
+    self.deposits[deposit_id] = Deposit({
         depositor: msg.sender,
-        token_id: tokenId
+        path: path,
+        amount: _amount0,
     })
-    log Deposited(tokenId, msg.sender, token0, token1, _amount, profit_taking, stop_loss, expire)
+    self.deposit_size = unsafe_add(deposit_id, 1)
+    log Deposited(deposit_id, token0, convert(slice(path, unsafe_sub(len(path), 20), 20), address), amount0, msg.sender, profit_taking, stop_loss, expire, is_stable_swap)
 
 @internal
-def _withdraw(tokenId: uint256, withdraw_type: WithdrawType) -> uint256:
-    response_256: Bytes[256] = raw_call(
-        NONFUNGIBLE_POSITION_MANAGER,
-        _abi_encode(tokenId, method_id=method_id("positions(uint256)")),
-        max_outsize = 256,
-        is_static_call = True
-    )
-    liquidity: uint128 = convert(slice(response_256, 224, 32), uint128)
-    token0: address = convert(slice(response_256, 64, 32), address)
-    token1: address = convert(slice(response_256, 96, 32), address)
-    NonfungiblePositionManager(NONFUNGIBLE_POSITION_MANAGER).decreaseLiquidity(DecreaseLiquidityParams({
-        tokenId: tokenId,
-        liquidity: liquidity,
-        amount0Min: 0,
-        amount1Min: 0,
-        deadline: block.timestamp
-    }))
-    amount0: uint256 = 0
-    amount1: uint256 = 0
-    amount0, amount1 = NonfungiblePositionManager(NONFUNGIBLE_POSITION_MANAGER).collect(CollectParams({
-        tokenId: tokenId,
-        recipient: self,
-        amount0Max: max_value(uint128),
-        amount1Max: max_value(uint128)
-    }))
-    NonfungiblePositionManager(NONFUNGIBLE_POSITION_MANAGER).burn(tokenId)
-    deposit: Deposit = self.deposits[tokenId]
-    self.deposits[tokenId] = Deposit({
-        pool: empty(address),
-        token0: empty(address),
-        token1: empty(address),
-        from_tick: 0,
-        to_tick: 0,
+@nonreentrant("lock")
+def _withdraw(deposit_id: uint256, expected: uint256, withdraw_type: WithdrawType) -> uint256:
+    deposit: Deposit = self.deposits[deposit_id]
+    if withdraw_type == WithdrawType.CANCEL:
+        assert msg.sender == deposit.depositor, "Unauthorized"
+    self.deposits[deposit_id] = Deposit({
         depositor: empty(address),
-        token_id: 0
+        path: empty(Bytes[224]),
+        amount: empty(uint256)
     })
-    is_right: bool = False
-    if deposit.token0 == token0 or (deposit.token0 == VETH and token0 == WETH):
-        if withdraw_type != WithdrawType.CANCEL:
-            is_right = True
+    assert deposit.amount > 0, "Empty deposit"
+    if withdraw_type == WithdrawType.CANCEL or withdraw_type == WithdrawType.EXPIRE:
+        token0: address = convert(slice(deposit.path, 0, 20), address)
+        if token0 == VETH:
+            WrappedEth(WETH).withdraw(deposit.amount)
+            send(deposit.depositor, deposit.amount)
+        else:
+            self._safe_transfer(token0, deposit.depositor, deposit.amount)
+        log Withdrawn(deposit_id, msg.sender, withdraw_type, deposit.amount)
+        return deposit.amount
     else:
-        if withdraw_type == WithdrawType.CANCEL:
-            is_right = True
-    fee: uint24 = Pool(deposit.pool).fee()
-    amount: uint256 = 0
-    if is_right:
-        if amount0 > 0:
-            self._safe_approve(token0, ROUTER, amount0)
-            amount1 += SwapRouter(ROUTER).exactInputSingle(ExactInputSingleParams({
-                tokenIn: token0,
-                tokenOut: token1,
-                fee: fee,
+        _out_amount: uint256 = 0
+        _path: Bytes[224] = deposit.path
+        token0: address = convert(slice(_path, 0, 20), address)
+        token1: address = convert(slice(_path, unsafe_sub(len(_path), 20), 20), address)
+        if token0 == VETH:
+            _path = slice(_path, 20, unsafe_sub(len(_path), 20))
+            WrappedEth(WETH).deposit(value=deposit.amount)
+            ERC20(WETH).approve(ROUTER, deposit.amount)
+            _out_amount = ERC20(token1).balanceOf(self)
+            SwapRouter(ROUTER).exactInput(ExactInputParams({
+                path: _path,
                 recipient: self,
                 deadline: block.timestamp,
-                amountIn: amount0,
-                amountOutMinimum: 0,
-                sqrtPriceLimitX96: 0
+                amountIn: deposit.amount,
+                amountOutMinimum: expected
             }))
-            amount0 = 0
-            amount = amount1
-    else:
-        if amount1 > 0:
-            self._safe_approve(token1, ROUTER, amount1)
-            amount0 += SwapRouter(ROUTER).exactInputSingle(ExactInputSingleParams({
-                tokenIn: token1,
-                tokenOut: token0,
-                fee: fee,
-                recipient: self,
-                deadline: block.timestamp,
-                amountIn: amount1,
-                amountOutMinimum: 0,
-                sqrtPriceLimitX96: 0
-            }))
-            amount1 = 0
-            amount = amount0
-    if amount0 > 0:
-        if token0 == WETH and (deposit.token0 == VETH or deposit.token1 == VETH):
-            WrappedEth(WETH).withdraw(amount0)
-            send(deposit.depositor, amount0)
+            _out_amount = ERC20(token1).balanceOf(self) - _out_amount
         else:
-            self._safe_transfer(token0, deposit.depositor, amount0)
-    if amount1 > 0:
-        if token1 == WETH and (deposit.token0 == VETH or deposit.token1 == VETH):
-            WrappedEth(WETH).withdraw(amount1)
-            send(deposit.depositor, amount1)
+            assert ERC20(token0).approve(ROUTER, deposit.amount), "Failed approve"
+            if token1 == VETH:
+                _path = slice(_path, 0, unsafe_sub(len(_path), 20))
+                _out_amount = ERC20(WETH).balanceOf(self)
+                SwapRouter(ROUTER).exactInput(ExactInputParams({
+                    path: _path,
+                    recipient: self,
+                    deadline: block.timestamp,
+                    amountIn: deposit.amount,
+                    amountOutMinimum: expected
+                }))
+                _out_amount = ERC20(WETH).balanceOf(self) - _out_amount
+                WrappedEth(WETH).withdraw(_out_amount)
+            else:
+                _out_amount = ERC20(token1).balanceOf(self)
+                SwapRouter(ROUTER).exactInput(ExactInputParams({
+                    path: _path,
+                    recipient: self,
+                    deadline: block.timestamp,
+                    amountIn: deposit.amount,
+                    amountOutMinimum: expected
+                }))
+                _out_amount = ERC20(token1).balanceOf(self) - _out_amount
+        if token1 == VETH:
+            send(deposit.depositor, _out_amount)
         else:
-            self._safe_transfer(token1, deposit.depositor, amount1)
-    log Withdrawn(tokenId, msg.sender, deposit.token0, deposit.token1, deposit.depositor, amount, withdraw_type)
-    return amount
+            self._safe_transfer(token1, deposit.depositor, _out_amount)
+        log Withdrawn(deposit_id, msg.sender, withdraw_type, _out_amount)
+        return _out_amount
 
 @external
-def withdraw(tokenId: uint256, withdraw_type: WithdrawType) -> uint256:
-    assert msg.sender == empty(address) # this will work as a view function only
-    deposit: Deposit = self.deposits[tokenId]
-    response_64: Bytes[64] = raw_call(
-        deposit.pool,
-        method_id("slot0()"),
-        max_outsize = 64,
-        is_static_call = True
-    )
-    tick: int24 = convert(slice(response_64, 32, 32), int24)
-    if deposit.from_tick < deposit.to_tick:
-        assert tick >= deposit.to_tick
-    else:
-        assert tick <= deposit.to_tick
-    return self._withdraw(tokenId, withdraw_type)
-
-@external
-@nonreentrant("lock")
-def multiple_withdraw(tokenIds: DynArray[uint256, MAX_SIZE], expected: DynArray[uint256, MAX_SIZE], withdraw_types: DynArray[WithdrawType, MAX_SIZE]):
-    self._paloma_check()
-    _len: uint256 = len(tokenIds)
-    assert _len == len(expected) and _len == len(withdraw_types), "Validation error"
-    for i in range(MAX_SIZE):
-        if i >= len(tokenIds):
-            break
-        deposit: Deposit = self.deposits[tokenIds[i]]
-        response_64: Bytes[64] = raw_call(
-            deposit.pool,
-            method_id("slot0()"),
-            max_outsize = 64,
-            is_static_call = True
-        )
-        tick: int24 = convert(slice(response_64, 32, 32), int24)
-        if deposit.from_tick < deposit.to_tick:
-            assert tick >= deposit.to_tick
-        else:
-            assert tick <= deposit.to_tick
-        assert self._withdraw(tokenIds[i], withdraw_types[i]) >= expected[i], "High slippage"
-
-@external
-@nonreentrant("lock")
-def cancel(tokenId: uint256, expected: uint256):
-    deposit: Deposit = self.deposits[tokenId]
-    assert deposit.depositor == msg.sender
-    assert self._withdraw(tokenId, WithdrawType.CANCEL) >= expected, "High slippage"
-
-@external
-@nonreentrant("lock")
-def multiple_cancel(tokenIds: DynArray[uint256, MAX_SIZE], expected: DynArray[uint256, MAX_SIZE]):
-    for i in range(MAX_SIZE):
-        if i >= len(tokenIds):
-            break
-        deposit: Deposit = self.deposits[tokenIds[i]]
-        assert deposit.depositor == msg.sender
-        assert self._withdraw(tokenIds[i], WithdrawType.CANCEL) >= expected[i], "High slippage"
+def cancel(deposit_id: uint256) -> uint256:
+    return self._withdraw(deposit_id, 0, WithdrawType.CANCEL)
 
 @internal
 def _paloma_check():
     assert msg.sender == self.compass, "Not compass"
     assert self.paloma == convert(slice(msg.data, unsafe_sub(len(msg.data), 32), 32), bytes32), "Invalid paloma"
+
+@external
+def multiple_withdraw(deposit_ids: DynArray[uint256, MAX_SIZE], expected: DynArray[uint256, MAX_SIZE], withdraw_types: DynArray[WithdrawType, MAX_SIZE]):
+    self._paloma_check()
+    _len: uint256 = len(deposit_ids)
+    assert _len == len(expected) and _len == len(withdraw_types), "Validation error"
+    for i in range(MAX_SIZE):
+        if i >= len(deposit_ids):
+            break
+        self._withdraw(deposit_ids[i], expected[i], withdraw_types[i])
+
+@external
+def withdraw(deposit_id: uint256, withdraw_type: WithdrawType) -> uint256:
+    assert msg.sender == empty(address) # this will work as a view function only
+    return self._withdraw(deposit_id, 1, withdraw_type)
 
 @external
 def update_compass(new_compass: address):
@@ -463,4 +318,4 @@ def update_service_fee(new_service_fee: uint256):
 @external
 @payable
 def __default__():
-    assert msg.sender == WETH
+    pass
