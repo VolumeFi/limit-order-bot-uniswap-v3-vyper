@@ -1,4 +1,4 @@
-# Limit Order Bot Vyper for Uniswap V2
+# Limit Order Bot Vyper for Uniswap V3
 
 ## Dependencies
 
