@@ -116,11 +116,15 @@ def __init__(_compass: address, router: address, _refund_wallet: address, _fee: 
 def _safe_transfer(_token: address, _to: address, _value: uint256):
     assert ERC20(_token).transfer(_to, _value, default_return_value=True), "Failed transfer"
 
+@internal
+def _safe_transfer_from(_token: address, _from: address, _to: address, _value: uint256):
+    assert ERC20(_token).transferFrom(_from, _to, _value, default_return_value=True), "Failed transferFrom"
+
 @external
 @payable
 @nonreentrant("lock")
 def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_loss: uint256, expire: uint256):
-    assert block.timestamp < expire, "Invalidated expire"
+    assert block.timestamp < expire, "Invalidate expire"
     _value: uint256 = msg.value
     _fee: uint256 = self.fee
     if _fee > 0:
@@ -133,12 +137,12 @@ def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_los
     amount: uint256 = 0
     if token0 == VETH:
         amount = amount0
-        assert _value >= amount, "Insuf deposit"
+        assert _value >= amount, "Insufficient deposit"
         _value = unsafe_sub(_value, amount)
         fee_index = 40
     else:
         amount = ERC20(token0).balanceOf(self)
-        assert ERC20(token0).transferFrom(msg.sender, self, amount, default_return_value=True), "Failed transferFrom"
+        self._safe_transfer_from(token0, msg.sender, self, amount)
         amount = ERC20(token0).balanceOf(self) - amount
     is_stable_swap: bool = True
     for i in range(8):
@@ -164,7 +168,7 @@ def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_los
     else:
         send(msg.sender, _value)
         _amount0 = ERC20(token0).balanceOf(self)
-        assert ERC20(token0).transferFrom(msg.sender, self, amount0, default_return_value=True), "Failed transferFrom"
+        self._safe_transfer_from(token0, msg.sender, self, amount0)
         _amount0 = ERC20(token0).balanceOf(self) - _amount0
         if _service_fee > 0:
             _service_fee_amount: uint256 = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
