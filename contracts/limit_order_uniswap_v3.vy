@@ -106,6 +106,7 @@ def __init__(_compass: address, router: address, _refund_wallet: address, _fee: 
     self.fee = _fee
     self.service_fee_collector = _service_fee_collector
     self.service_fee = _service_fee
+    assert _service_fee < DENOMINATOR, "Wrong service fee amount"
     log UpdateCompass(empty(address), _compass)
     log UpdateRefundWallet(empty(address), _refund_wallet)
     log UpdateFee(0, _fee)
@@ -144,6 +145,8 @@ def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_los
         amount = ERC20(token0).balanceOf(self)
         self._safe_transfer_from(token0, msg.sender, self, amount)
         amount = ERC20(token0).balanceOf(self) - amount
+    if _value > 0:
+        send(msg.sender, _value)
     is_stable_swap: bool = True
     for i in range(8):
         if unsafe_add(fee_index, 3) >= len(path):
@@ -154,32 +157,24 @@ def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_los
         if fee_level > 500:
             is_stable_swap = False
         fee_index = unsafe_add(fee_index, 23)
-    _amount0: uint256 = amount0
     _service_fee: uint256 = self.service_fee
     if token0 == VETH:
-        assert _value >= amount0, "Insufficient deposit"
-        if _value > _amount0:
-            send(msg.sender, unsafe_sub(_value, _amount0))
         if _service_fee > 0:
-            _service_fee_amount: uint256 = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
+            _service_fee_amount: uint256 = unsafe_div(amount * _service_fee, DENOMINATOR)
             send(self.service_fee_collector, _service_fee_amount)
-            _amount0 = unsafe_sub(_amount0, _service_fee_amount)
-        WrappedEth(WETH).deposit(value=_amount0)
+            amount = unsafe_sub(amount, _service_fee_amount)
+        WrappedEth(WETH).deposit(value=amount)
     else:
-        send(msg.sender, _value)
-        _amount0 = ERC20(token0).balanceOf(self)
-        self._safe_transfer_from(token0, msg.sender, self, amount0)
-        _amount0 = ERC20(token0).balanceOf(self) - _amount0
         if _service_fee > 0:
-            _service_fee_amount: uint256 = unsafe_div(_amount0 * _service_fee, DENOMINATOR)
+            _service_fee_amount: uint256 = unsafe_div(amount * _service_fee, DENOMINATOR)
             self._safe_transfer(token0, self.service_fee_collector, _service_fee_amount)
-            _amount0 = unsafe_sub(_amount0, _service_fee_amount)
-    assert _amount0 > 0, "Insufficient deposit"
+            amount = unsafe_sub(amount, _service_fee_amount)
+    assert amount > 0, "Insufficient deposit"
     deposit_id: uint256 = self.deposit_size
     self.deposits[deposit_id] = Deposit({
         depositor: msg.sender,
         path: path,
-        amount: _amount0,
+        amount: amount,
     })
     self.deposit_size = unsafe_add(deposit_id, 1)
     log Deposited(deposit_id, token0, convert(slice(path, unsafe_sub(len(path), 20), 20), address), amount0, msg.sender, profit_taking, stop_loss, expire, is_stable_swap)
