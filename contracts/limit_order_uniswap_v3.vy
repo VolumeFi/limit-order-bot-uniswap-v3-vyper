@@ -163,7 +163,6 @@ def deposit(path: Bytes[224], amount0: uint256, profit_taking: uint256, stop_los
             _service_fee_amount: uint256 = unsafe_div(amount * _service_fee, DENOMINATOR)
             send(self.service_fee_collector, _service_fee_amount)
             amount = unsafe_sub(amount, _service_fee_amount)
-        WrappedEth(WETH).deposit(value=amount)
     else:
         if _service_fee > 0:
             _service_fee_amount: uint256 = unsafe_div(amount * _service_fee, DENOMINATOR)
@@ -194,7 +193,6 @@ def _withdraw(deposit_id: uint256, expected: uint256, withdraw_type: WithdrawTyp
     if withdraw_type == WithdrawType.CANCEL or withdraw_type == WithdrawType.EXPIRE:
         token0: address = convert(slice(deposit.path, 0, 20), address)
         if token0 == VETH:
-            WrappedEth(WETH).withdraw(deposit.amount)
             send(deposit.depositor, deposit.amount)
         else:
             self._safe_transfer(token0, deposit.depositor, deposit.amount)
